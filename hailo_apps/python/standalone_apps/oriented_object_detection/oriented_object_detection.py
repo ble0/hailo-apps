@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# example usage
+# cd hailo-apps/
+# source setup_env.sh
+# cd hailo_apps/python/standalone_apps/object_detection
+# ./object_detection.py -i usb -cr scaledsd --show-fps
+# ./object_detection.py -i usb -cr scaledsd --show-fps --save-output --output-dir /dev/shm
+
+
 import argparse
 import os
 import sys
@@ -301,3 +309,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
