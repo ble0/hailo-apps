@@ -255,12 +255,14 @@ def get_standalone_parser() -> argparse.ArgumentParser:
         "-cr",
         "--camera-resolution",
         type=str,
-        choices=["sd", "hd", "fhd"],
+        choices=["sd", "hd", "fhd", "native", "scaledsd"],
         help=(
             "Predefined resolution for camera input sources. "
-            "Options: 'sd' (640x480, Standard Definition), 'hd' (1280x720, High Definition), "
-            "'fhd' (1920x1080, Full High Definition). "
-            "Default is 'sd'. This flag is only applicable when using camera input sources."
+            "'sd' (640x480), 'hd' (1280x720), 'fhd' (1920x1080), "
+            "'native' (let the driver choose, no override). "
+            "'scaledsd': capture at native 960x600 then center-crop to 640x480 "
+            "in software \u2014 guaranteed correct geometry, no scaling, no letterboxing. "
+            "Crop offsets: x=160, y=60. Recommended for Arducam 0234 in headless mode."
         ),
     )
 

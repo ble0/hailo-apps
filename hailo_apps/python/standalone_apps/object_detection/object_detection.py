@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import signal
 import queue
 import threading
 from functools import partial
@@ -126,6 +127,18 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
         cap_processing_mode = select_cap_processing_mode(input_type, save_output, frame_rate)
 
     stop_event = threading.Event()
+
+    # Allow Ctrl+C to gracefully stop the camera pipeline.
+    # Without this, preprocess_thread.join() blocks forever because
+    # preprocess_from_cap() loops on cap.read() with no exit path.
+    _prev_sigint = signal.getsignal(signal.SIGINT)
+    def _sigint_handler(sig, frame):
+        logger.info("\nKeyboardInterrupt — stopping pipeline gracefully...")
+        stop_event.set()
+        # Restore default so a second Ctrl+C force-kills the process.
+        signal.signal(signal.SIGINT, _prev_sigint)
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     tracker = None
     fps_tracker = None
     if show_fps:
@@ -159,16 +172,19 @@ def run_inference_pipeline(net, input_src, batch_size, labels, output_dir,
         target=infer, args=(hailo_inference, input_queue, output_queue, stop_event)
     )
 
+    if show_fps:
+        fps_tracker.start()
+
     preprocess_thread.start()
     postprocess_thread.start()
     infer_thread.start()
 
-    if show_fps:
-        fps_tracker.start()
-
     preprocess_thread.join()
     infer_thread.join()
     postprocess_thread.join()
+
+    # Restore original SIGINT handler now that threads are done.
+    signal.signal(signal.SIGINT, _prev_sigint)
 
     if show_fps:
         logger.info(fps_tracker.frame_rate_summary())

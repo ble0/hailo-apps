@@ -101,6 +101,54 @@ class PiCamera2CaptureAdapter:
                 pass
 
 
+class CroppedCapAdapter:
+    """
+    Wraps a cv2.VideoCapture and applies a guaranteed center crop on every
+    read(), presenting the cropped size to all downstream code.
+
+    Use case — "scaledsd": camera is opened at its native 960x600
+    (so the driver never has to negotiate), then each frame is center-cropped
+    in software to 640x480. Pure crop, no scaling, no letterboxing, no geometry
+    distortion. All downstream code (preprocess, visualize, VideoWriter) sees
+    a clean 640x480 camera with no surprises.
+
+    Crop offsets are computed once from the actual captured frame size.
+    get(CAP_PROP_FRAME_WIDTH/HEIGHT) always reports the OUTPUT (cropped) dims.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture, out_w: int, out_h: int):
+        self._cap   = cap
+        self._out_w = out_w
+        self._out_h = out_h
+        cap_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or out_w)
+        cap_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or out_h)
+        self._x0 = (cap_w - out_w) // 2
+        self._y0 = (cap_h - out_h) // 2
+
+    def isOpened(self) -> bool:
+        return self._cap.isOpened()
+
+    def read(self):
+        ret, frame = self._cap.read()
+        if not ret or frame is None:
+            return False, None
+        cropped = frame[
+            self._y0 : self._y0 + self._out_h,
+            self._x0 : self._x0 + self._out_w,
+        ]
+        return True, cropped
+
+    def get(self, prop_id: int) -> float:
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._out_w)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._out_h)
+        return self._cap.get(prop_id)
+
+    def release(self):
+        self._cap.release()
+
+
 class CapProcessingMode(str, Enum):
     """
     Capture processing modes.
@@ -208,30 +256,79 @@ def open_usb_camera(resolution: Optional[str]):
             sys.exit(1)
 
     # --------------------------------------------
-    # Open camera
+    # Open camera — force V4L2 backend on Linux to
+    # avoid GStreamer YUYV issues in headless mode.
     # --------------------------------------------
-    cap = cv2.VideoCapture(camera_index)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     if not cap.isOpened():
         logger.error(f"Failed to open USB camera index {camera_index}")
         sys.exit(1)
 
     # --------------------------------------------
-    # Apply resolution (USB only)
+    # Resolution handling.
+    #
+    # "scaledsd": Request native 960x600 (guaranteed on Arducam 0234),
+    #   then center-crop every frame in software to 640x480.
+    #   Pure crop — no scaling, no letterboxing, no geometry distortion.
+    #   Crop offsets: x=(960-640)//2=160, y=(600-480)//2=60.
+    #   All downstream code sees exactly 640x480.
+    #
+    # "sd"/"hd"/"fhd": Request via cap.set() (advisory; driver
+    #   may snap to its nearest supported mode).
+    #
+    # "native" / None: Leave camera at hardware default, no override.
     # --------------------------------------------
-    if resolution in CAMERA_RESOLUTION_MAP:
+    _SCALEDSD_CAP_W, _SCALEDSD_CAP_H = 960, 600
+    _SCALEDSD_OUT_W, _SCALEDSD_OUT_H = 640, 480
+
+    if resolution == "scaledsd":
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  _SCALEDSD_CAP_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _SCALEDSD_CAP_H)
+        logger.debug(
+            f"scaledsd: capturing at {_SCALEDSD_CAP_W}x{_SCALEDSD_CAP_H}, "
+            f"will crop to {_SCALEDSD_OUT_W}x{_SCALEDSD_OUT_H}"
+        )
+    elif resolution is not None and resolution != "native" and resolution in CAMERA_RESOLUTION_MAP:
         w, h = CAMERA_RESOLUTION_MAP[resolution]
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        logger.debug(f"USB camera resolution forced to {w}x{h}")
+        ret_w = cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        ret_h = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        if not ret_w or not ret_h:
+            logger.warning(
+                f"Driver rejected requested resolution {w}x{h} "
+                f"(ret_w={ret_w}, ret_h={ret_h}). "
+                f"Camera will use its nearest supported mode."
+            )
+        else:
+            logger.debug(f"USB camera resolution requested: {w}x{h}")
 
     # --------------------------------------------
-    # Validate stream (real camera test)
+    # Validate stream: confirms the camera works and
+    # logs the resolution the driver actually gave us.
     # --------------------------------------------
     ok, frame = cap.read()
     if not ok or frame is None:
         cap.release()
         logger.error("USB camera opened but produced no frames.")
         sys.exit(1)
+
+    actual_h, actual_w = frame.shape[:2]
+    logger.info(f"USB camera streaming at {actual_w}x{actual_h} (YUYV→BGR via V4L2)")
+
+    if resolution == "scaledsd":
+        if actual_w < _SCALEDSD_OUT_W or actual_h < _SCALEDSD_OUT_H:
+            cap.release()
+            logger.error(
+                f"scaledsd: camera delivered {actual_w}x{actual_h}, "
+                f"which is smaller than the crop target "
+                f"{_SCALEDSD_OUT_W}x{_SCALEDSD_OUT_H}."
+            )
+            sys.exit(1)
+        adapter = CroppedCapAdapter(cap, _SCALEDSD_OUT_W, _SCALEDSD_OUT_H)
+        logger.info(
+            f"scaledsd: center-cropping {actual_w}x{actual_h} "
+            f"→ {_SCALEDSD_OUT_W}x{_SCALEDSD_OUT_H} (no scaling)"
+        )
+        return adapter
 
     return cap
 
@@ -686,7 +783,8 @@ def preprocess_from_cap(
     if frames and not should_stop():
         input_queue.put((frames, processed))
 
-    input_queue.put(None)
+    # Note: the sentinel None is written by the calling preprocess() function,
+    # not here, to avoid a double-sentinel when preprocess() also appends it.
 
 
 def preprocess_images(images: List[np.ndarray], batch_size: int, input_queue: queue.Queue, width: int, height: int,
@@ -802,8 +900,8 @@ def visualize(
 
     # Window + writer init (only for camera/video, not images)
     if cap is not None:
-        cv2.namedWindow("Output", cv2.WND_PROP_FULLSCREEN)
-        cv2.setWindowProperty("Output", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        #cv2.namedWindow("Output", cv2.WND_PROP_FULLSCREEN)
+        #cv2.setWindowProperty("Output", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         base_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         base_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
@@ -862,6 +960,10 @@ def visualize(
 
             if fps_tracker is not None:
                 fps_tracker.increment()
+                # Use the .fps property — there is no get_fps() method.
+                current_fps = fps_tracker.fps
+                num_detections = len(inference_result) if inference_result is not None else 0
+                print(f"FPS: {current_fps:.2f} | Detections: {num_detections}", end='\r')
 
             # Convert RGB to BGR for OpenCV display/save
             bgr_frame = cv2.cvtColor(frame_with_detections, cv2.COLOR_RGB2BGR)
@@ -869,17 +971,17 @@ def visualize(
 
             # Display / Save
             if cap is not None:
-                cv2.imshow("Output", frame_to_show)
+                #cv2.imshow("Output", frame_to_show)
                 if save_stream_output and out is not None and frame_width and frame_height:
                     out.write(cv2.resize(frame_to_show, (frame_width, frame_height)))
 
                 # User pressed 'q' → start shutdown:
                 # set stop_event for other threads and skip further processing.
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    quitting = True
-                    if stop_event is not None:
-                        stop_event.set()
-                    continue
+                #if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                #    quitting = True
+                #    if stop_event is not None:
+                #        stop_event.set()
+                #    continue
             else:
                 cv2.imwrite(os.path.join(output_dir, f"output_{image_id}.png"), frame_to_show)
 
@@ -895,7 +997,14 @@ def visualize(
     if cap is not None:
         cap.release()
 
-    cv2.destroyAllWindows()
+    # destroyAllWindows is a no-op in headless mode but can log a warning;
+    # only call it when we actually created windows (i.e. not headless).
+    # In the current headless branch cv2.namedWindow / imshow are commented
+    # out, so this call is safe but intentionally left for completeness.
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
 
 
 
@@ -999,3 +1108,4 @@ def resolve_arch(arch: str | None) -> str:
         "Please specify --arch or set the environment variable 'hailo_arch'."
     )
     sys.exit(1)
+
