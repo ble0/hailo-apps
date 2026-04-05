@@ -29,6 +29,8 @@ Usage examples:
 
     # Enable tracking + FPS counter:
     ./face_detection_mono.py --hef scrfd_10g.hef -i usb --headless --track --show-fps
+
+    nohup python face_detection_scrfd_10g.py --hef scrfd_10g.hef  -i usb --camera-resolution scaledsd --headless --show-fps --face-capture --face-capture-dir /dev/shm > /dev/shm/custom_log.txt 2>&1 &
 """
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,10 @@ except ImportError:
 # Hailo runtime
 from hailo_platform import HEF, VDevice, FormatType, HailoSchedulingAlgorithm
 from hailo_platform.pyhailort.pyhailort import FormatOrder
+
+# Global variables for camera reinitialization (avoid deep refactoring)
+_global_camera_index = None
+_global_preset_name = None
 
 def get_unique_filename(directory: str, prefix: str, extension: str) -> str:
     """Create timestamped file inside directory/YYYY-MM-DD/HH/ subfolder."""
@@ -123,10 +129,39 @@ MAX_INPUT_QUEUE_SIZE  = 60
 MAX_OUTPUT_QUEUE_SIZE = 60
 MAX_ASYNC_INFER_JOBS  = 20
 
-CAMERA_RESOLUTION_MAP: Dict[str, Tuple[int, int]] = {
-    "sd":  (640, 480),
-    "hd":  (1280, 720),
-    "fhd": (1920, 1080),
+# ---------------------------------------------------------------------------
+# Camera / input resolution presets
+# ---------------------------------------------------------------------------
+# Each preset defines:
+#   - capture: (width, height) to request from camera (None = let driver decide)
+#   - target:  (width, height) that will be fed to the model (must match model input size)
+#   - method:  "letterbox" (standard) or "crop_pad" (center-crop then pad, like scaledsd)
+CAMERA_PRESETS = {
+    "native": {
+        "capture": None,          # let driver decide
+        "target": (640, 640),     # model input size
+        "method": "letterbox",
+    },
+    "sd": {
+        "capture": (640, 480),
+        "target": (640, 640),
+        "method": "letterbox",
+    },
+    "hd": {
+        "capture": (1280, 720),
+        "target": (640, 640),
+        "method": "letterbox",
+    },
+    "fhd": {
+        "capture": (1920, 1080),
+        "target": (640, 640),
+        "method": "letterbox",
+    },
+    "scaledsd": {
+        "capture": (960, 600),    # Arducam 0234 native
+        "target": (640, 640),
+        "method": "crop_pad",     # center-crop to 640x600, then pad to 640x640
+    },
 }
 
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mov", ".mkv", ".webm")
@@ -155,10 +190,6 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         },
     }
 }
-
-# Arducam 0234 native resolution for "scaledsd" mode
-_SCALEDSD_CAP_W, _SCALEDSD_CAP_H = 960, 600
-_SCALEDSD_OUT_W, _SCALEDSD_OUT_H = 640, 640
 
 # Only draw motion trails for face class IDs
 _TRACKLET_CLASSES = [0]
@@ -839,17 +870,14 @@ def get_usb_video_devices() -> Dict[int, str]:
     return devices
 
 
-def open_usb_camera(resolution: Optional[str]):
-    """
-    Open a USB camera via V4L2.
+def open_usb_camera(preset_name: str):
+    """Open USB camera using a preset from CAMERA_PRESETS."""
+    preset = CAMERA_PRESETS.get(preset_name)
+    if preset is None:
+        logger.error(f"Unknown camera preset: {preset_name}")
+        sys.exit(1)
 
-    resolution options:
-        None / "native" — let driver decide (no cap.set calls)
-        "sd"             — request 640x480
-        "hd"             — request 1280x720
-        "fhd"            — request 1920x1080
-        "scaledsd"       — open at native 960x600, then center-crop/pad to 640x640
-    """
+    # ---- USB device detection (copied from original) ----
     usb_devices = get_usb_video_devices()
     if not usb_devices:
         logger.error("USB mode requested but NO USB cameras detected.")
@@ -871,33 +899,24 @@ def open_usb_camera(resolution: Optional[str]):
             logger.error(f"CAMERA_INDEX={camera_index} is not a USB camera. "
                          f"Available: {sorted(usb_devices.keys())}")
             sys.exit(1)
+    # -----------------------------------------------------
 
-    # Force V4L2 backend — avoids GStreamer YUYV issues in headless mode
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    # cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
     if not cap.isOpened():
         logger.error(f"Failed to open USB camera index {camera_index}")
         sys.exit(1)
 
-    # -----------------------------------------------------------------------
-    # Resolution handling
-    # -----------------------------------------------------------------------
-    if resolution == "scaledsd":
-        # Request native resolution so the driver never has to negotiate
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  _SCALEDSD_CAP_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _SCALEDSD_CAP_H)
-        logger.debug(f"scaledsd: requesting {_SCALEDSD_CAP_W}x{_SCALEDSD_CAP_H}, "
-                     f"will center-crop/pad to {_SCALEDSD_OUT_W}x{_SCALEDSD_OUT_H}")
-    elif resolution is not None and resolution != "native" \
-            and resolution in CAMERA_RESOLUTION_MAP:
-        w, h = CAMERA_RESOLUTION_MAP[resolution]
-        rw = cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        rh = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        if not rw or not rh:
-            logger.warning(f"Driver rejected {w}x{h} — will use nearest supported mode.")
-        else:
-            logger.debug(f"USB camera resolution requested: {w}x{h}")
+    # Set capture resolution if specified
+    capture_res = preset["capture"]
+    if capture_res is not None:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_res[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, capture_res[1])
+        logger.debug(f"Requested capture resolution: {capture_res[0]}x{capture_res[1]}")
+    else:
+        logger.debug("No capture resolution requested – using driver default")
 
-    # Validate stream — also logs what the driver actually gave us
+    # Verify stream
     ok, frame = cap.read()
     if not ok or frame is None:
         cap.release()
@@ -907,15 +926,17 @@ def open_usb_camera(resolution: Optional[str]):
     ah, aw = frame.shape[:2]
     logger.info(f"USB camera streaming at {aw}x{ah} (YUYV→BGR via V4L2)")
 
-    # For scaledsd: wrap in crop/pad adapter
-    if resolution == "scaledsd":
-        adapter = CroppedCapAdapter(cap, _SCALEDSD_OUT_W, _SCALEDSD_OUT_H)
-        logger.info(f"scaledsd: center-cropping/padding {aw}x{ah} → "
-                    f"{_SCALEDSD_OUT_W}x{_SCALEDSD_OUT_H} (no scaling, no geometric distortion)")
+    # Apply method-specific adapter if needed
+    if preset["method"] == "crop_pad":
+        target_w, target_h = preset["target"]
+        adapter = CroppedCapAdapter(cap, target_w, target_h)
+        logger.info(f"crop_pad: {aw}x{ah} → {target_w}x{target_h}")
         return adapter
 
-    return cap
+    _global_camera_index = camera_index
+    _global_preset_name = preset_name
 
+    return cap
 
 def open_rpi_camera():
     try:
@@ -956,7 +977,7 @@ def init_input_source(input_src: str, batch_size: int, resolution: Optional[str]
     src = input_src.strip()
 
     if src == "usb":
-        cap = open_usb_camera(resolution)
+        cap = open_usb_camera(resolution)   # open_usb_camera now uses CAMERA_PRESETS
         logger.info("Using USB camera")
         return cap, None, "usb"
 
@@ -1070,26 +1091,125 @@ def _preprocess_images(images, batch_size, input_queue, width, height, preproces
             ([img for img in batch],
              [preprocess_fn(img, width, height) for img in batch]))
 
+def _reinit_camera(old_cap):
+    """
+    Release the old VideoCapture and create a brand new one using the same
+    camera index and preset. Returns the new cap, or None if reinit fails.
+    """
+
+    preset_name = _global_preset_name
+    camera_index = _global_camera_index
+
+    logger.warning("Attempting to reinitialize camera (index %d, preset '%s')...",
+                   camera_index, preset_name)
+    if old_cap is not None:
+        old_cap.release()
+    time.sleep(1.0)   # Let the driver clean up
+
+    # Reopen using the same logic as open_usb_camera (but we cannot call open_usb_camera
+    # directly because it may re‑detect devices – we replicate the minimal steps here).
+    # However, for simplicity and consistency, we can call open_usb_camera again.
+    # But open_usb_camera expects a preset name, not an index. We need to create a new cap
+    # with the saved index and preset.
+    try:
+        # Directly open the device with V4L2
+        new_cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        if not new_cap.isOpened():
+            logger.error("Failed to open camera during reinitialization")
+            return None
+
+        # Re‑apply the same resolution and method as originally used
+        preset = CAMERA_PRESETS.get(preset_name)
+        if preset is None:
+            logger.error("Unknown preset '%s' during reinit", preset_name)
+            return None
+
+        capture_res = preset.get("capture")
+        if capture_res is not None:
+            new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_res[0])
+            new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, capture_res[1])
+
+        # Optionally set buffer size again (if you uncommented it)
+        new_cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+
+        # Test read one frame to verify it works
+        ret, test_frame = new_cap.read()
+        if not ret or test_frame is None:
+            logger.error("Camera reinitialized but produces no frames")
+            new_cap.release()
+            return None
+
+        # If the preset uses crop_pad, wrap the new cap in CroppedCapAdapter
+        if preset["method"] == "crop_pad":
+            target_w, target_h = preset["target"]
+            new_cap = CroppedCapAdapter(new_cap, target_w, target_h)
+
+        logger.info("Camera reinitialized successfully.")
+        return new_cap
+    except Exception as e:
+        logger.error(f"Exception during camera reinit: {e}")
+        return None
 
 def _preprocess_from_cap(cap, batch_size, input_queue, width, height,
-                          mode, preprocess_fn, target_fps, stop_event):
+                         mode, preprocess_fn, target_fps, stop_event):
+    """
+    Reads frames from the camera, applies preprocessing, and pushes batches.
+    If the camera fails repeatedly, it attempts to re‑initialise the device
+    automatically without crashing the pipeline.
+    """
+
+    preset_name = _global_preset_name
+    camera_index = _global_camera_index
+
     def should_stop():
         return stop_event is not None and stop_event.is_set()
 
-    next_ts    = time.monotonic()
+    next_ts = time.monotonic()
     keep_period = (1.0 / float(target_fps)) if mode == CapProcessingMode.CAMERA_FRAME_DROP else None
     vt0 = wt0 = None
     frames, processed = [], []
 
-    while not should_stop():
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 30   # About 1 second of failures at 30 FPS
 
+    while not should_stop():
+        # ----- RETRY LOOP for cap.read() -----
+        ret = False
+        frame_bgr = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            ret, frame_bgr = cap.read()
+            if ret:
+                consecutive_failures = 0   # success: reset failure counter
+                break
+            # Short sleep between retries
+            time.sleep(0.01)
+
+        if not ret:
+            consecutive_failures += 1
+            logger.warning(f"Frame read failed (attempt {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error("Persistent camera failure. Attempting full reinitialisation...")
+                new_cap = _reinit_camera(cap, camera_index, preset_name)
+                if new_cap is not None:
+                    cap = new_cap
+                    consecutive_failures = 0
+                    logger.info("Camera reinitialised, resuming capture.")
+                    continue   # go to next loop iteration, skip frame processing
+                else:
+                    logger.critical("Camera reinitialisation failed. Shutting down capture thread.")
+                    break      # exit the while loop (pipeline will stop)
+            else:
+                # For transient failures, just skip this frame and try the next one
+                continue
+
+        # ----- Normal frame processing (only if we have a good frame) -----
         if mode == CapProcessingMode.VIDEO_PACE:
             pos_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
             if vt0 is None:
-                vt0 = pos_ms; wt0 = time.monotonic()
+                vt0 = pos_ms
+                wt0 = time.monotonic()
             desired = wt0 + (pos_ms - vt0) / 1000.0
             now = time.monotonic()
             if now < desired:
@@ -1112,7 +1232,7 @@ def _preprocess_from_cap(cap, batch_size, input_queue, width, height,
     # Flush partial last batch
     if frames and not should_stop():
         input_queue.put((frames, processed))
-    # Sentinel written by caller (preprocess), not here — avoids double-sentinel
+    # Sentinel is written by the caller (preprocess) – not here
 
 
 # ===========================================================================
@@ -1779,13 +1899,13 @@ def run_inference_pipeline(hef_path: str, input_src: str, batch_size: int,
               callback, fps_tracker, output_resolution,
               frame_rate, False, stop_event, headless, face_capture, capture_dir))
 
-    t_pre.start(); t_inf.start(); t_post.start()
-    t_pre.join(); t_inf.join(); t_post.join()
-    signal.signal(signal.SIGINT, _prev_sigint)
-
     if show_fps:
         fps_tracker.start()
         logger.info(fps_tracker.summary())
+
+    t_pre.start(); t_inf.start(); t_post.start()
+    t_pre.join(); t_inf.join(); t_post.join()
+    signal.signal(signal.SIGINT, _prev_sigint)
 
     logger.success("Inference was successful!")
     if save_output or input_src.lower() not in ("usb", "rpi"):
@@ -1836,15 +1956,9 @@ Examples:
     p.add_argument("--save-output", action="store_true",
                    help="Save annotated frames to disk. "
                         "Images → PNG files; camera/video → output.avi")
-    p.add_argument("--camera-resolution", "-cr", type=str, default=None,
-                   choices=["sd", "hd", "fhd", "scaledsd", "native"],
-                   help=("Camera capture resolution preset:\n"
-                         "  sd       640x480 (advisory)\n"
-                         "  hd       1280x720 (advisory)\n"
-                         "  fhd      1920x1080 (advisory)\n"
-                         "  scaledsd capture at native 960x600, crop width to 640 then pad to 640x640\n"
-                         "           (no scaling, no geometric distortion; reduced horizontal FOV)\n"
-                         "  native   let the driver decide (default)"))
+    p.add_argument("--camera-resolution", "-cr", type=str, default=None,    
+                   choices=list(CAMERA_PRESETS.keys()),
+                   help="Camera capture preset")
     p.add_argument("--output-resolution", "-or", type=int, nargs=2,
                    metavar=("WIDTH", "HEIGHT"),
                    help="Resize output frames before saving/display (e.g. 1280 720)")
